@@ -47,6 +47,8 @@ typedef struct {
     char     text[CHAT_MESSAGE_TEXT_SIZE];  // Message text (UTF-8)
     uint32_t received_at;                   // Unix timestamp (local clock)
     uint32_t timestamp;                     // Unix timestamp (remote clock)
+    bool     sent;                          // Sent by us
+    bool     repeated;                      // Repeated by others
 } chat_message_t;
 
 // Constants
@@ -156,7 +158,7 @@ static void blink_message_led(bool r, bool g, bool b) {
     tanmatsu_coprocessor_set_message(handle, false, false, false, false, false, false, false, false);
 }
 
-bool handle_chat_message(uint8_t channel_hash, const char* name, const char* text, uint32_t timestamp) {
+bool handle_chat_message(uint8_t channel_hash, const char* name, const char* text, uint32_t timestamp, bool sent) {
     printf("Chat message received - Name: '%s', Text: '%s', Timestamp: %" PRIu32 "\n", name, text, timestamp);
     size_t amount_of_messages = sizeof(chat_messages) / sizeof(chat_message_t);
 
@@ -164,7 +166,10 @@ bool handle_chat_message(uint8_t channel_hash, const char* name, const char* tex
 
     if (previous_message->channel_hash == channel_hash && strcmp(previous_message->name, name) == 0 &&
         strcmp(previous_message->text, text) == 0) {
-        printf("Duplicate message received, ignoring.\n");
+        previous_message->repeated = true;
+        // Bit of a hack but oh well, this is just a preview app anyway
+        bsp_input_event_t event    = {.type = INPUT_EVENT_TYPE_LAST};
+        bsp_input_inject_event(&event);
         return false;
     }
 
@@ -174,6 +179,7 @@ bool handle_chat_message(uint8_t channel_hash, const char* name, const char* tex
     snprintf(message->name, CHAT_MESSAGE_NAME_SIZE, "%s", name);
     snprintf(message->text, CHAT_MESSAGE_TEXT_SIZE, "%s", text);
     message->timestamp = timestamp;
+    message->sent      = sent;
 
     chat_message_index++;
     if (chat_message_index >= amount_of_messages) {
@@ -185,30 +191,6 @@ bool handle_chat_message(uint8_t channel_hash, const char* name, const char* tex
     bsp_input_inject_event(&event);
 
     return true;
-}
-
-void deserialize_group_txt(meshcore_grp_txt_t* grp_txt) {
-    uint8_t* ptr = grp_txt->decrypted.data;
-    memcpy(&grp_txt->decrypted.timestamp, ptr, sizeof(uint32_t));
-    ptr                                  += sizeof(uint32_t);
-    grp_txt->decrypted.text_type          = *ptr;
-    ptr                                  += sizeof(uint8_t);
-    size_t text_length                    = grp_txt->decrypted.data_length - (ptr - grp_txt->decrypted.data);
-    grp_txt->decrypted.text               = (char*)ptr;
-    grp_txt->decrypted.text[text_length]  = '\0';
-}
-
-void serialize_group_txt(meshcore_grp_txt_t* grp_txt) {
-    uint8_t* ptr = grp_txt->data;
-    memcpy(ptr, &grp_txt->decrypted.timestamp, sizeof(uint32_t));
-    ptr                += sizeof(uint32_t);
-    *ptr                = grp_txt->decrypted.text_type;
-    ptr                += sizeof(uint8_t);
-    size_t text_length  = strlen(grp_txt->decrypted.text);
-    memcpy(ptr, grp_txt->decrypted.text, text_length);
-    ptr                  += text_length;
-    *ptr                  = '\0';
-    grp_txt->data_length  = (ptr - grp_txt->data);
 }
 
 void meshcore_parse(lora_protocol_lora_packet_t* packet) {
@@ -350,34 +332,26 @@ void meshcore_parse(lora_protocol_lora_packet_t* packet) {
                 if (memcmp(out, grp_txt.mac, MESHCORE_CIPHER_MAC_SIZE) == 0) {
                     printf("MAC verification: SUCCESS\n");
 
-                    // Copy encrypted data to buffer for decryption, AES works in-place
-                    grp_txt.decrypted.data_length = grp_txt.data_length;
-                    memcpy(grp_txt.decrypted.data, grp_txt.data, grp_txt.data_length);
-
+                    // Decrypt data (in-place)
                     struct AES_ctx ctx;
                     AES_init_ctx(&ctx, key);
-                    for (uint8_t i = 0; i < (grp_txt.decrypted.data_length / 16); i++) {
-                        AES_ECB_decrypt(&ctx, &grp_txt.decrypted.data[i * 16]);
+                    for (uint8_t i = 0; i < (grp_txt.data_length / 16); i++) {
+                        AES_ECB_decrypt(&ctx, &grp_txt.data[i * 16]);
                     }
 
-                    printf("Data [%d]: ", grp_txt.decrypted.data_length);
-                    for (unsigned int i = 0; i < grp_txt.decrypted.data_length; i++) {
-                        printf("%02X", grp_txt.decrypted.data[i]);
-                    }
-                    printf("\n");
+                    meshcore_grp_txt_data_t data = {0};
+                    meshcore_grp_txt_data_deserialize(grp_txt.data, grp_txt.data_length, &data);
 
-                    deserialize_group_txt(&grp_txt);
+                    printf("Timestamp: %" PRIu32 "\n", data.timestamp);
+                    printf("Text Type: %u\n", data.text_type);
+                    printf("Message: '%s'\n", data.text);
 
-                    printf("Timestamp: %" PRIu32 "\n", grp_txt.decrypted.timestamp);
-                    printf("Text Type: %u\n", grp_txt.decrypted.text_type);
-                    printf("Message: '%s'\n", grp_txt.decrypted.text);
-
-                    char*  ptr      = grp_txt.decrypted.text;
-                    char*  text_ptr = grp_txt.decrypted.text;
+                    char*  ptr      = data.text;
+                    char*  text_ptr = data.text;
                     size_t len      = strlen(ptr);
 
                     for (size_t i = 0; i < len; i++) {
-                        ptr = &grp_txt.decrypted.text[i];
+                        ptr = &data.text[i];
                         if (*ptr == ':') {
                             *ptr = '\0';
                             if (i + 2 < len) {
@@ -387,8 +361,8 @@ void meshcore_parse(lora_protocol_lora_packet_t* packet) {
                         }
                     }
 
-                    bool handled = handle_chat_message(grp_txt.channel_hash, grp_txt.decrypted.text, text_ptr,
-                                                       grp_txt.decrypted.timestamp);
+                    bool handled =
+                        handle_chat_message(grp_txt.channel_hash, data.text, text_ptr, data.timestamp, false);
 
                     blink_message_led(!handled, handled, false);
                     break;
@@ -420,7 +394,8 @@ void render_chat(void) {
         if (message->timestamp != 0) {
             char text[CHAT_MESSAGE_NAME_SIZE + CHAT_MESSAGE_TEXT_SIZE + 4];
             snprintf(text, sizeof(text), "%s: %s", message->name, message->text);
-            pax_draw_text(&fb, WHITE, pax_font_saira_regular, 16, 0, 72 + (i * 20), text);
+            pax_draw_text(&fb, (message->repeated && message->sent) ? 0xFF00FF00 : (message->sent ? 0xFFFFFF00 : WHITE),
+                          pax_font_saira_regular, 16, 0, 72 + (i * 20), text);
         }
     }
     blit();
@@ -462,15 +437,16 @@ void send_input(void) {
     grp_txt.channel_hash       = 0x11;  // #public
 
     // Data to be encrypted
-    grp_txt.decrypted.timestamp = (uint32_t)time(NULL);
-    grp_txt.decrypted.text_type = 0x00;  // plain text
-    grp_txt.decrypted.text      = message_text;
+    meshcore_grp_txt_data_t data = {0};
+    data.timestamp               = (uint32_t)time(NULL);
+    data.text_type               = 0x00;  // plain text
+    memcpy(data.text, message_text, strlen(message_text));
 
     // Add message to chatlog
-    handle_chat_message(grp_txt.channel_hash, "(You)", text_buffer, grp_txt.decrypted.timestamp);
+    handle_chat_message(grp_txt.channel_hash, nickname, text_buffer, data.timestamp, true);
 
     // Pack data
-    serialize_group_txt(&grp_txt);
+    meshcore_grp_txt_data_serialize(&data, grp_txt.data, &grp_txt.data_length);
 
     // Encrypt data
     uint8_t encrypt_length = grp_txt.data_length;
@@ -709,7 +685,7 @@ void app_main(void) {
     xTaskCreatePinnedToCore(meshcore_task, TAG, 1024 * 16, NULL, 10, NULL, CONFIG_SOC_CPU_CORES_NUM - 1);
 
     pax_background(&fb, BLACK);
-    pax_draw_text(&fb, 0xFFFF00FF, pax_font_saira_regular, 24, 0, 0, "Meshcore chat app (preview)");
+    pax_draw_text(&fb, 0xFFFF00FF, pax_font_saira_regular, 24, 0, 0, "Meshcore chat app (preview) - build 2");
     blit();
 
     while (1) {
